@@ -260,7 +260,7 @@ class Mangago :
         }.sortedBy { it.first }
 
         val firstUrls = getChapterImageUrls(document)
-        if (firstUrls.isEmpty()) throw Exception("Could not extract image urls")
+        if (firstUrls.isEmpty()) throw Exception("Mangago: pageListParse failed - decoded image url list is empty for ${document.location()}")
         val hasEmptyUrls = firstUrls.any { it.isBlank() }
 
         val pages = pageLinks.mapIndexed { idx, (_, href) ->
@@ -306,16 +306,19 @@ class Mangago :
                 pageContexts[page] = derived
             }
             derived
-        } ?: throw Exception("Missing page context")
+        } ?: throw Exception("Mangago: fetchImageUrl failed - missing page context for page index ${page.index}, url='${page.url}'")
 
         val state = synchronized(chunkStateLock) { chapterStates[context.chapterKey] }
-            ?: throw Exception("Missing chapter state")
+            ?: run {
+                val keys = synchronized(chunkStateLock) { chapterStates.keys.joinToString(limit = 10) }
+                throw Exception("Mangago: fetchImageUrl failed - missing chapter state for key '${context.chapterKey}'. availableKeys=[$keys], pageUrl='${page.url}'")
+            }
 
         val chunkStart = getChunkStartPage(context.pageNumber)
         val lock = synchronized(chunkStateLock) {
             if (state.loadedChunks.contains(chunkStart) && !state.pageByNumber[context.pageNumber]?.imageUrl.isNullOrBlank()) {
                 return@fromCallable state.pageByNumber[context.pageNumber]?.imageUrl
-                    ?: throw Exception("Could not resolve image url for page ${context.pageNumber}")
+                    ?: throw Exception("Mangago: fetchImageUrl failed - cached chunk reports loaded but image url is still null for page ${context.pageNumber} (chapter '${context.chapterKey}')")
             }
             state.chunkLocks.getOrPut(chunkStart) { Any() }
         }
@@ -326,7 +329,7 @@ class Mangago :
                     state.firstChunkUrls
                 } else {
                     val chunkUrl = state.pageUrlByNumber[chunkStart]
-                        ?: throw Exception("Could not find chunk url for page $chunkStart")
+                        ?: throw Exception("Mangago: fetchImageUrl failed - could not find chunk start page url for chunkStart=$chunkStart in chapter '${context.chapterKey}'")
                     val chunkDocument = client.newCall(GET(chunkUrl, headers)).execute().use { response ->
                         Jsoup.parse(response.body.string(), chunkUrl)
                     }
@@ -357,7 +360,7 @@ class Mangago :
 
         val resolved = state.pageByNumber[context.pageNumber]?.imageUrl
         if (resolved.isNullOrBlank()) {
-            throw Exception("Could not resolve image url for page ${context.pageNumber}")
+            throw Exception("Mangago: fetchImageUrl failed - could not resolve image url for page ${context.pageNumber} in chapter '${context.chapterKey}'")
         }
         resolved
     }
@@ -375,20 +378,23 @@ class Mangago :
 
     private fun getChapterKeyFromUrl(url: String): String {
         val normalized = url.removeSuffix("/")
-        val lastSegment = normalized.substringAfterLast("/")
+        val httpUrl = runCatching { normalized.toHttpUrl() }.getOrNull()
+        val segments = httpUrl?.pathSegments?.filter { it.isNotBlank() }.orEmpty()
+        val lastSegment = segments.lastOrNull().orEmpty()
+
         val chapterUrl = when {
             lastSegment.startsWith("pg-") -> normalized.substringBeforeLast("/")
-            lastSegment.toIntOrNull() != null -> normalized.substringBeforeLast("/")
+            normalized.contains("/chapter/") && lastSegment.toIntOrNull() != null && segments.size >= 4 -> normalized.substringBeforeLast("/")
             else -> normalized
-        }
-        return chapterUrl.lowercase()
+        }.lowercase()
+        return chapterUrl
     }
 
     private fun getChapterImageUrls(document: Document): List<String> {
         val imgsrcsScript = document.selectFirst("script:containsData(imgsrcs)")?.html()
-            ?: throw Exception("Could not find imgsrcs")
+            ?: throw Exception("Mangago: getChapterImageUrls failed - could not find 'imgsrcs' script in ${document.location()}")
         val imgsrcRaw = imgSrcsRegex.find(imgsrcsScript)?.groupValues?.get(1)
-            ?: throw Exception("Could not extract imgsrcs")
+            ?: throw Exception("Mangago: getChapterImageUrls failed - could not extract base64 imgsrcs from script in ${document.location()}")
         val imgsrcs = Base64.decode(imgsrcRaw, Base64.DEFAULT)
 
         val chapterJsUrl = document.getElementsByTag("script").first {
