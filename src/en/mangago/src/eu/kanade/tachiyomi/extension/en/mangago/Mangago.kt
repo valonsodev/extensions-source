@@ -62,9 +62,19 @@ class Mangago :
         val chunkLocks: MutableMap<Int, Any> = mutableMapOf(),
     )
 
+    private data class ChapterJsDecryptCache(
+        val deobfChapterJs: String,
+        val key: ByteArray,
+        val iv: ByteArray,
+        val time: Long,
+    )
+
     private val chapterStates = mutableMapOf<String, ChapterState>()
     private val pageContexts = WeakHashMap<Page, PageContext>()
     private val chunkStateLock = Any()
+    private val chapterJsCache = mutableMapOf<String, ChapterJsDecryptCache>()
+    private val chapterJsCacheLocks = mutableMapOf<String, Any>()
+    private val chapterJsCacheLock = Any()
 
     override val name = "Mangago"
 
@@ -359,11 +369,6 @@ class Mangago :
         return super.pageListRequest(chapter)
     }
 
-    private var cachedDeofChapterJS: String? = null
-    private var cachedChapterJsUrl: String? = null
-    private var cachedKey: ByteArray? = null
-    private var cachedIv: ByteArray? = null
-    private var cachedTime: Long = 0
     private val maxCacheTime = 1000 * 60 * 5 // 5 minutes
 
     override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException("Unused")
@@ -390,41 +395,67 @@ class Mangago :
             it.attr("src").contains("chapter.js", ignoreCase = true)
         }.attr("abs:src")
 
-        val shouldRefreshCache =
-            cachedChapterJsUrl != chapterJsUrl ||
-                cachedDeofChapterJS == null ||
-                cachedKey == null ||
-                cachedIv == null ||
-                System.currentTimeMillis() - cachedTime > maxCacheTime
-
-        if (shouldRefreshCache) {
-            val obfuscatedChapterJs = client.newCall(GET(chapterJsUrl, headers)).execute().body.string()
-            cachedDeofChapterJS = SoJsonV4Deobfuscator.decode(obfuscatedChapterJs)
-            cachedKey = findHexEncodedVariable(cachedDeofChapterJS!!, "key").decodeHex()
-            cachedIv = findHexEncodedVariable(cachedDeofChapterJS!!, "iv").decodeHex()
-            cachedChapterJsUrl = chapterJsUrl
-            cachedTime = System.currentTimeMillis()
-        }
+        val decryptCache = getOrBuildChapterJsCache(chapterJsUrl)
 
         val cipher = Cipher.getInstance(hashCipher)
-        val keyS = SecretKeySpec(cachedKey, aes)
-        cipher.init(Cipher.DECRYPT_MODE, keyS, IvParameterSpec(cachedIv))
+        val keyS = SecretKeySpec(decryptCache.key, aes)
+        cipher.init(Cipher.DECRYPT_MODE, keyS, IvParameterSpec(decryptCache.iv))
 
         var imageList = cipher.doFinal(imgsrcs).toString(Charsets.UTF_8)
 
-        imageList = unescrambleImageList(imageList, cachedDeofChapterJS!!)
+        imageList = unescrambleImageList(imageList, decryptCache.deobfChapterJs)
 
-        val cols = colsRegex.find(cachedDeofChapterJS!!)?.groupValues?.get(1) ?: ""
+        val cols = colsRegex.find(decryptCache.deobfChapterJs)?.groupValues?.get(1) ?: ""
 
         val resolvedUrls = imageList.split(",").map {
             if (it.contains("cspiclink")) {
-                "$it#desckey=${getDescramblingKey(cachedDeofChapterJS!!, it)}&cols=$cols"
+                "$it#desckey=${getDescramblingKey(decryptCache.deobfChapterJs, it)}&cols=$cols"
             } else {
                 it
             }
         }
 
         return resolvedUrls
+    }
+
+    private fun getOrBuildChapterJsCache(chapterJsUrl: String): ChapterJsDecryptCache {
+        val now = System.currentTimeMillis()
+        synchronized(chapterJsCacheLock) {
+            val cached = chapterJsCache[chapterJsUrl]
+            if (cached != null && now - cached.time <= maxCacheTime) {
+                return cached
+            }
+        }
+
+        val lock = synchronized(chapterJsCacheLock) {
+            chapterJsCacheLocks.getOrPut(chapterJsUrl) { Any() }
+        }
+
+        synchronized(lock) {
+            val secondCheckNow = System.currentTimeMillis()
+            synchronized(chapterJsCacheLock) {
+                val cached = chapterJsCache[chapterJsUrl]
+                if (cached != null && secondCheckNow - cached.time <= maxCacheTime) {
+                    return cached
+                }
+            }
+
+            val obfuscatedChapterJs = client.newCall(GET(chapterJsUrl, headers)).execute().body.string()
+            val deobfChapterJs = SoJsonV4Deobfuscator.decode(obfuscatedChapterJs)
+            val key = findHexEncodedVariable(deobfChapterJs, "key").decodeHex()
+            val iv = findHexEncodedVariable(deobfChapterJs, "iv").decodeHex()
+            val entry = ChapterJsDecryptCache(
+                deobfChapterJs = deobfChapterJs,
+                key = key,
+                iv = iv,
+                time = System.currentTimeMillis(),
+            )
+
+            synchronized(chapterJsCacheLock) {
+                chapterJsCache[chapterJsUrl] = entry
+            }
+            return entry
+        }
     }
 
     private fun getChunkStartPage(pageNumber: Int): Int = ((pageNumber - 1) / 5) * 5 + 1
